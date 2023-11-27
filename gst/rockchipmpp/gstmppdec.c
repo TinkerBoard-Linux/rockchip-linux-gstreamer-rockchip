@@ -298,14 +298,14 @@ gst_mpp_dec_stop (GstVideoDecoder * decoder)
 
   g_mutex_clear (&self->mutex);
 
-  mpp_destroy (self->mpp_ctx);
-
   if (self->input_state) {
     gst_video_codec_state_unref (self->input_state);
     self->input_state = NULL;
   }
 
   gst_mpp_dec_clear_allocator (decoder);
+
+  mpp_destroy (self->mpp_ctx);
 
   GST_DEBUG_OBJECT (self, "stopped");
 
@@ -627,7 +627,7 @@ gst_mpp_dec_get_frame (GstVideoDecoder * decoder, GstClockTime pts)
 
     if (GST_CLOCK_TIME_IS_VALID (f->pts)) {
       /* Prefer frame with close PTS */
-      if (abs ((gint) f->pts - (gint) pts) < 3 * GST_MSECOND) {
+      if (abs ((gint) (f->pts - pts)) < 3 * GST_MSECOND) {
         frame = f;
 
         GST_DEBUG_OBJECT (self, "using matched frame (#%d)",
@@ -860,12 +860,14 @@ gst_mpp_dec_loop (GstVideoDecoder * decoder)
     goto info_change;
   }
 
+  if (!self->convert && gst_mpp_info_changed (&self->info, mframe)) {
+    self->task_ret = gst_mpp_dec_apply_info_change (decoder, mframe);
+    if (self->task_ret != GST_FLOW_OK)
+      goto info_change;
+  }
+
   if (!mpp_frame_get_buffer (mframe))
     goto out;
-
-  /* Apply info change when video info not unavaliable (no info-change event) */
-  if (!self->info.size)
-    self->task_ret = gst_mpp_dec_apply_info_change (decoder, mframe);
 
   mode = mpp_frame_get_mode (mframe);
 #ifdef MPP_FRAME_FLAG_IEP_DEI_MASK
@@ -952,8 +954,8 @@ gst_mpp_dec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   GstMppDec *self = GST_MPP_DEC (decoder);
   GstMapInfo mapinfo = { 0, };
   GstBuffer *tmp;
+  GstClockTime start_time, deadline_time;
   GstFlowReturn ret;
-  gint timeout_ms = MPP_INPUT_TIMEOUT_MS;
   gint interval_ms = 5;
   MppPacket mpkt = NULL;
 
@@ -997,6 +999,8 @@ gst_mpp_dec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   if (GST_CLOCK_TIME_IS_VALID (frame->pts))
     self->seen_valid_pts = TRUE;
 
+  start_time = gst_util_get_timestamp ();
+  deadline_time = start_time + MPP_INPUT_TIMEOUT_MS * GST_MSECOND;
   while (1) {
     GST_VIDEO_DECODER_STREAM_UNLOCK (decoder);
     if (klass->send_mpp_packet (decoder, mpkt, interval_ms)) {
@@ -1005,8 +1009,7 @@ gst_mpp_dec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
     }
     GST_VIDEO_DECODER_STREAM_LOCK (decoder);
 
-    timeout_ms -= interval_ms;
-    if (timeout_ms <= 0)
+    if (gst_util_get_timestamp () > deadline_time)
       goto send_error;
   }
 
