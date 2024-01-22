@@ -112,15 +112,22 @@ gst_mpp_use_rga ()
 {
   static int mpp_use_rga = -1;
 
-#ifdef HAVE_RGA
   if (mpp_use_rga < 0) {
+#ifndef HAVE_RGA
+    GST_WARNING ("RGA disabled at compile time");
+#else
     const gchar *buf = g_getenv ("GST_MPP_NO_RGA");
-    if (!buf || buf[0] == '0')
+    if (!buf || buf[0] == '0') {
+      GST_WARNING ("RGA enabled");
       mpp_use_rga = 1;
-    else
-      mpp_use_rga = 0;
-  }
+      return 1;
+    }
+
+    GST_WARNING ("RGA disabled by env (GST_MPP_NO_RGA)");
 #endif
+
+    mpp_use_rga = 0;
+  }
 
   return mpp_use_rga > 0;
 }
@@ -375,6 +382,13 @@ gst_mpp_video_info_align (GstVideoInfo * info, gint hstride, gint vstride)
   GST_DEBUG ("aligning %dx%d to %dx%d", GST_VIDEO_INFO_WIDTH (info),
       GST_VIDEO_INFO_HEIGHT (info), hstride, vstride);
 
+  if (hstride < GST_VIDEO_INFO_WIDTH (info) ||
+      vstride < GST_VIDEO_INFO_HEIGHT (info)) {
+    GST_ERROR ("unable to align %dx%d to %dx%d", GST_VIDEO_INFO_WIDTH (info),
+        GST_VIDEO_INFO_HEIGHT (info), hstride, vstride);
+    return FALSE;
+  }
+
   gst_video_alignment_reset (&align);
 
   /* Apply vstride */
@@ -444,6 +458,7 @@ gst_mpp_info_changed (GstVideoInfo * info, MppFrame * mframe)
   gint hstride = mpp_frame_get_hor_stride (mframe);
   gint vstride = mpp_frame_get_ver_stride (mframe);
   GstVideoFormat format = gst_mpp_mpp_format_to_gst_format (mpp_format);
+  gboolean afbc = !!MPP_FRAME_FMT_IS_FBC (mpp_format);
 
   if (GST_VIDEO_INFO_FORMAT (info) != format)
     return TRUE;
@@ -457,7 +472,7 @@ gst_mpp_info_changed (GstVideoInfo * info, MppFrame * mframe)
   if (GST_MPP_VIDEO_INFO_HSTRIDE (info) != hstride)
     return TRUE;
 
-  if (GST_VIDEO_INFO_N_PLANES (info) == 1)
+  if (GST_VIDEO_INFO_N_PLANES (info) == 1 || afbc)
     return FALSE;
 
   if (GST_MPP_VIDEO_INFO_VSTRIDE (info) != vstride)

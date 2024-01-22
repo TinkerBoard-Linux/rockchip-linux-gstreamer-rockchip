@@ -37,7 +37,7 @@ GST_DEBUG_CATEGORY (GST_CAT_DEFAULT);
 #define parent_class gst_mpp_enc_parent_class
 G_DEFINE_ABSTRACT_TYPE (GstMppEnc, gst_mpp_enc, GST_TYPE_VIDEO_ENCODER);
 
-#define MPP_PENDING_MAX 2       /* Max number of MPP pending frame */
+#define MPP_PENDING_MAX 16      /* Max number of MPP pending frame */
 
 #define GST_MPP_ENC_TASK_STARTED(encoder) \
     (gst_pad_get_task_state ((encoder)->srcpad) == GST_TASK_STARTED)
@@ -458,6 +458,11 @@ gst_mpp_enc_reset (GstVideoEncoder * encoder, gboolean drain, gboolean final)
   self->task_ret = GST_FLOW_OK;
   self->pending_frames = 0;
 
+  if (self->frames) {
+    g_list_free (self->frames);
+    self->frames = NULL;
+  }
+
   /* Force re-apply prop */
   self->prop_dirty = TRUE;
 
@@ -468,6 +473,7 @@ static gboolean
 gst_mpp_enc_start (GstVideoEncoder * encoder)
 {
   GstMppEnc *self = GST_MPP_ENC (encoder);
+  MppPollType timeout = MPP_POLL_NON_BLOCK;
 
   GST_DEBUG_OBJECT (self, "starting");
 
@@ -481,6 +487,12 @@ gst_mpp_enc_start (GstVideoEncoder * encoder)
 
   if (mpp_create (&self->mpp_ctx, &self->mpi))
     goto err_unref_alloc;
+
+  if (self->mpi->control (self->mpp_ctx, MPP_SET_INPUT_TIMEOUT, &timeout))
+    goto err_destroy_mpp;
+
+  if (self->mpi->control (self->mpp_ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout))
+    goto err_destroy_mpp;
 
   if (mpp_init (self->mpp_ctx, MPP_CTX_ENC, self->mpp_type))
     goto err_destroy_mpp;
@@ -498,6 +510,8 @@ gst_mpp_enc_start (GstVideoEncoder * encoder)
   self->input_state = NULL;
   self->flushing = FALSE;
   self->pending_frames = 0;
+  self->frames = NULL;
+  self->required_keyframe_number = 0;
 
   g_mutex_init (&self->mutex);
 
@@ -582,6 +596,8 @@ gst_mpp_enc_apply_strides (GstVideoEncoder * encoder, gint hstride,
       vstride == GST_MPP_VIDEO_INFO_VSTRIDE (info))
     return TRUE;
 
+  GST_INFO_OBJECT (self, "strides updated to (%dx%d)", hstride, vstride);
+
   self->prop_dirty = TRUE;
   return gst_mpp_video_info_align (info, hstride, vstride);
 }
@@ -593,7 +609,6 @@ gst_mpp_enc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
   GstVideoInfo *info = &self->info;
   MppFrameFormat format;
   gint width, height, hstride, vstride;
-  gboolean convert = FALSE;
 
   GST_DEBUG_OBJECT (self, "setting format: %" GST_PTR_FORMAT, state->caps);
 
@@ -624,7 +639,11 @@ gst_mpp_enc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
   width = self->width ? : width;
   height = self->height ? : height;
 
-  /* Check for conversion */
+  /*
+   * Check for conversion
+   * NOTE: Not checking the strides here, since they might not be the actual
+   * ones (could be overrided by video-meta)
+   */
   if (self->rotation || !gst_mpp_enc_format_supported (format) ||
       width != GST_VIDEO_INFO_WIDTH (info) ||
       height != GST_VIDEO_INFO_HEIGHT (info)) {
@@ -633,13 +652,8 @@ gst_mpp_enc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
       return FALSE;
     }
 
-    convert = TRUE;
-  }
-
-  if (convert) {
     /* Prefer NV12 when using RGA conversion */
-    if (gst_mpp_use_rga ())
-      format = MPP_FMT_YUV420SP;
+    format = MPP_FMT_YUV420SP;
 
     gst_mpp_video_info_update_format (info,
         gst_mpp_mpp_format_to_gst_format (format), width, height);
@@ -764,7 +778,7 @@ gst_mpp_enc_convert (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
   GstVideoInfo dst_info = self->info;
   GstVideoFrame src_frame, dst_frame;
   GstBuffer *outbuf, *inbuf;
-  GstMemory *in_mem, *out_mem;
+  GstMemory *in_mem, *out_mem = NULL;
   GstVideoMeta *meta;
   gsize size, maxsize, offset;
   gint src_hstride, src_vstride;
@@ -780,9 +794,6 @@ gst_mpp_enc_convert (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
     }
   }
 
-  src_hstride = GST_MPP_VIDEO_INFO_HSTRIDE (&src_info);
-  src_vstride = GST_MPP_VIDEO_INFO_VSTRIDE (&src_info);
-
   size = gst_buffer_get_sizes (inbuf, &offset, &maxsize);
   if (size < GST_VIDEO_INFO_SIZE (&src_info)) {
     GST_ERROR_OBJECT (self, "input buffer too small (%" G_GSIZE_FORMAT
@@ -790,29 +801,11 @@ gst_mpp_enc_convert (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
     return NULL;
   }
 
-  if (gst_mpp_video_info_align (&dst_info, src_hstride, src_vstride) &&
-      gst_mpp_video_info_matched (&dst_info, &src_info)) {
-    gst_mpp_enc_apply_strides (encoder, src_hstride, src_vstride);
-
-    if (!gst_mpp_enc_apply_properties (encoder))
-      return NULL;
-  }
-
-  dst_info = self->info;
-
   outbuf = gst_buffer_new ();
   if (!outbuf)
     goto err;
 
-  gst_buffer_copy_into (outbuf, inbuf,
-      GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS, 0, 0);
-
-  gst_buffer_add_video_meta_full (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
-      GST_VIDEO_INFO_FORMAT (&dst_info),
-      GST_VIDEO_INFO_WIDTH (&dst_info), GST_VIDEO_INFO_HEIGHT (&dst_info),
-      GST_VIDEO_INFO_N_PLANES (&dst_info), dst_info.offset, dst_info.stride);
-
-  if (self->rotation || !gst_mpp_video_info_matched (&src_info, &dst_info))
+  if (self->rotation)
     goto convert;
 
   if (gst_buffer_n_memory (inbuf) != 1)
@@ -824,15 +817,30 @@ gst_mpp_enc_convert (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
   if (!out_mem)
     goto convert;
 
+  src_hstride = GST_MPP_VIDEO_INFO_HSTRIDE (&src_info);
+  src_vstride = GST_MPP_VIDEO_INFO_VSTRIDE (&src_info);
+
+  if (!gst_mpp_video_info_align (&dst_info, src_hstride, src_vstride) ||
+      !gst_mpp_enc_video_info_align (&dst_info) ||
+      !gst_mpp_video_info_matched (&src_info, &dst_info))
+    goto convert;
+
+  gst_mpp_enc_apply_strides (encoder, src_hstride, src_vstride);
+  if (!gst_mpp_enc_apply_properties (encoder))
+    goto err;
+
   gst_buffer_append_memory (outbuf, out_mem);
 
   /* Keep a ref of the original memory */
   gst_buffer_append_memory (outbuf, gst_memory_ref (in_mem));
 
   GST_DEBUG_OBJECT (self, "using imported buffer");
-  return outbuf;
+  goto out;
 
 convert:
+  if (out_mem)
+    gst_memory_unref (out_mem);
+
   out_mem = gst_allocator_alloc (self->allocator,
       GST_VIDEO_INFO_SIZE (&dst_info), NULL);
   if (!out_mem)
@@ -845,7 +853,7 @@ convert:
       gst_mpp_rga_convert (inbuf, &src_info, out_mem, &dst_info,
           self->rotation)) {
     GST_DEBUG_OBJECT (self, "using RGA converted buffer");
-    return outbuf;
+    goto out;
   }
 #endif
 
@@ -866,8 +874,22 @@ convert:
   }
 
   GST_DEBUG_OBJECT (self, "using software converted buffer");
+
+out:
+  gst_buffer_copy_into (outbuf, inbuf,
+      GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS, 0, 0);
+
+  dst_info = self->info;
+  gst_buffer_add_video_meta_full (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
+      GST_VIDEO_INFO_FORMAT (&dst_info),
+      GST_VIDEO_INFO_WIDTH (&dst_info), GST_VIDEO_INFO_HEIGHT (&dst_info),
+      GST_VIDEO_INFO_N_PLANES (&dst_info), dst_info.offset, dst_info.stride);
+
   return outbuf;
 err:
+  if (out_mem)
+    gst_memory_unref (out_mem);
+
   if (outbuf)
     gst_buffer_unref (outbuf);
 
@@ -898,57 +920,98 @@ gst_mpp_enc_force_keyframe (GstVideoEncoder * encoder, gboolean keyframe)
   return TRUE;
 }
 
-static void
-gst_mpp_enc_loop (GstVideoEncoder * encoder)
+static gboolean
+gst_mpp_enc_send_frame_locked (GstVideoEncoder * encoder)
+{
+  GstMppEnc *self = GST_MPP_ENC (encoder);
+  GstVideoCodecFrame *frame;
+  GstMemory *mem;
+  MppFrame mframe;
+  MppBuffer mbuf;
+  gboolean keyframe;
+  guint32 frame_number;
+
+  if (!self->frames)
+    return FALSE;
+
+  if (mpp_frame_init (&mframe))
+    return FALSE;
+
+  mpp_frame_set_fmt (mframe, mpp_frame_get_fmt (self->mpp_frame));
+  mpp_frame_set_width (mframe, mpp_frame_get_width (self->mpp_frame));
+  mpp_frame_set_height (mframe, mpp_frame_get_height (self->mpp_frame));
+  mpp_frame_set_hor_stride (mframe, mpp_frame_get_hor_stride (self->mpp_frame));
+  mpp_frame_set_ver_stride (mframe, mpp_frame_get_ver_stride (self->mpp_frame));
+
+  frame_number = GPOINTER_TO_UINT (g_list_nth_data (self->frames, 0));
+  frame = gst_video_encoder_get_frame (encoder, frame_number);
+
+  keyframe = GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame);
+  if (keyframe) {
+    /* TODO: Find a way to set exact keyframe request */
+    self->required_keyframe_number = frame_number;
+    gst_mpp_enc_force_keyframe (encoder, TRUE);
+  }
+
+  /* HACK: Get the converted input buffer from frame->output_buffer */
+  mem = gst_buffer_peek_memory (frame->output_buffer, 0);
+  mbuf = gst_mpp_mpp_buffer_from_gst_memory (mem);
+  mpp_frame_set_buffer (mframe, mbuf);
+
+  gst_video_codec_frame_unref (frame);
+
+  if (!self->mpi->encode_put_frame (self->mpp_ctx, mframe)) {
+    GST_DEBUG_OBJECT (self, "encoding frame %d", frame_number);
+    self->frames = g_list_delete_link (self->frames, self->frames);
+    return TRUE;
+  }
+
+  mpp_frame_deinit (mframe);
+  return FALSE;
+}
+
+static gboolean
+gst_mpp_enc_poll_packet_locked (GstVideoEncoder * encoder)
 {
   GstMppEnc *self = GST_MPP_ENC (encoder);
   GstVideoCodecFrame *frame;
   GstBuffer *buffer;
   GstMemory *mem;
   MppFrame mframe;
-  MppPacket mpkt = NULL;
+  MppPacket mpkt;
+  MppMeta meta;
   MppBuffer mbuf;
-  gboolean keyframe;
   gint pkt_size;
 
-  GST_MPP_ENC_WAIT (encoder, self->pending_frames || self->flushing);
+  self->mpi->encode_get_packet (self->mpp_ctx, &mpkt);
+  if (!mpkt)
+    return FALSE;
 
-  GST_VIDEO_ENCODER_STREAM_LOCK (encoder);
+  /* Deinit input frame */
+  meta = mpp_packet_get_meta (mpkt);
+  if (!mpp_meta_get_frame (meta, KEY_INPUT_FRAME, &mframe))
+    mpp_frame_deinit (mframe);
 
-  if (self->flushing && !self->pending_frames)
-    goto flushing;
-
-  frame = gst_video_encoder_get_oldest_frame (encoder);
+  /* Wake up the frame producer */
   self->pending_frames--;
-
   GST_MPP_ENC_BROADCAST (encoder);
 
-  /* HACK: get the converted input buffer from frame->output_buffer */
-  mem = gst_buffer_peek_memory (frame->output_buffer, 0);
-  mbuf = gst_mpp_mpp_buffer_from_gst_memory (mem);
+  /* This encoded frame must be the oldest one */
+  frame = gst_video_encoder_get_oldest_frame (encoder);
 
-  mframe = self->mpp_frame;
-  mpp_frame_set_buffer (mframe, mbuf);
+  if (self->flushing && !self->draining)
+    goto drop;
 
-  keyframe = GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame);
-  if (keyframe)
-    gst_mpp_enc_force_keyframe (encoder, TRUE);
-
-  /* Encode one frame */
-  GST_VIDEO_ENCODER_STREAM_UNLOCK (encoder);
-  if (!self->mpi->encode_put_frame (self->mpp_ctx, mframe))
-    self->mpi->encode_get_packet (self->mpp_ctx, &mpkt);
-  GST_VIDEO_ENCODER_STREAM_LOCK (encoder);
-
-  if (keyframe)
+  /* TODO: Remove it when using exact keyframe request */
+  if (frame->system_frame_number == self->required_keyframe_number) {
     gst_mpp_enc_force_keyframe (encoder, FALSE);
-
-  if (!mpkt)
-    goto error;
+    self->required_keyframe_number = 0;
+  }
 
   pkt_size = mpp_packet_get_length (mpkt);
-
   mbuf = mpp_packet_get_buffer (mpkt);
+  if (!mbuf)
+    goto error;
 
   if (self->zero_copy_pkt) {
     buffer = gst_buffer_new ();
@@ -977,18 +1040,45 @@ gst_mpp_enc_loop (GstVideoEncoder * encoder)
   gst_buffer_replace (&frame->output_buffer, buffer);
   gst_buffer_unref (buffer);
 
-  if (self->flushing && !self->draining)
-    goto drop;
-
   GST_DEBUG_OBJECT (self, "finish frame ts=%" GST_TIME_FORMAT,
       GST_TIME_ARGS (frame->pts));
 
   gst_video_encoder_finish_frame (encoder, frame);
 
 out:
-  if (mpkt)
-    mpp_packet_deinit (&mpkt);
+  mpp_packet_deinit (&mpkt);
+  return TRUE;
+error:
+  GST_WARNING_OBJECT (self, "can't process this frame");
+drop:
+  GST_DEBUG_OBJECT (self, "drop frame");
+  gst_buffer_replace (&frame->output_buffer, NULL);
+  gst_video_encoder_finish_frame (encoder, frame);
+  goto out;
+}
 
+static void
+gst_mpp_enc_loop (GstVideoEncoder * encoder)
+{
+  GstMppEnc *self = GST_MPP_ENC (encoder);
+
+  GST_MPP_ENC_WAIT (encoder, self->pending_frames || self->flushing);
+
+  GST_VIDEO_ENCODER_STREAM_LOCK (encoder);
+
+  if (self->flushing && !self->pending_frames) {
+    GST_INFO_OBJECT (self, "flushing");
+    self->task_ret = GST_FLOW_FLUSHING;
+    goto out;
+  }
+
+  /* Try sending ready frames to MPP (non-block) */
+  while (gst_mpp_enc_send_frame_locked (encoder));
+
+  /* Try polling encoded packets from MPP (non-block) */
+  while (gst_mpp_enc_poll_packet_locked (encoder));
+
+out:
   if (self->task_ret != GST_FLOW_OK) {
     GST_DEBUG_OBJECT (self, "leaving output thread: %s",
         gst_flow_get_name (self->task_ret));
@@ -997,19 +1087,6 @@ out:
   }
 
   GST_VIDEO_ENCODER_STREAM_UNLOCK (encoder);
-  return;
-flushing:
-  GST_INFO_OBJECT (self, "flushing");
-  self->task_ret = GST_FLOW_FLUSHING;
-  goto out;
-error:
-  GST_WARNING_OBJECT (self, "can't process this frame");
-  goto drop;
-drop:
-  GST_DEBUG_OBJECT (self, "drop frame");
-  gst_buffer_replace (&frame->output_buffer, NULL);
-  gst_video_encoder_finish_frame (encoder, frame);
-  goto out;
 }
 
 static GstFlowReturn
@@ -1048,7 +1125,13 @@ gst_mpp_enc_handle_frame (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
       || self->flushing);
   GST_VIDEO_ENCODER_STREAM_LOCK (encoder);
 
+  if (G_UNLIKELY (self->flushing))
+    goto flushing;
+
   self->pending_frames++;
+  self->frames =
+      g_list_append (self->frames,
+      GUINT_TO_POINTER (frame->system_frame_number));
 
   GST_MPP_ENC_BROADCAST (encoder);
 

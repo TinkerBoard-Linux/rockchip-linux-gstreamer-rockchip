@@ -539,7 +539,9 @@ gst_mpp_dec_apply_info_change (GstVideoDecoder * decoder, MppFrame mframe)
 
     /* HACK: MPP might have extra offsets for AFBC */
     dst_height += offset_y;
-    vstride = dst_height;
+
+    if (vstride < dst_height)
+      vstride = dst_height;
 
     /* HACK: Fake hstride for Rockchip VOP driver */
     hstride = 0;
@@ -571,7 +573,18 @@ gst_mpp_dec_get_frame (GstVideoDecoder * decoder, GstClockTime pts)
 
   /* Choose PTS source when getting the first frame */
   if (is_first_frame) {
-    frame = frames->data;
+    /* Find the frame with earliest PTS (including invalid PTS) */
+    for (frame = NULL, l = frames, i = 0; l != NULL; l = l->next, i++) {
+      GstVideoCodecFrame *f = l->data;
+
+      if (!GST_CLOCK_TIME_IS_VALID (f->pts)) {
+        frame = f;
+        break;
+      }
+
+      if (!frame || frame->pts > f->pts)
+        frame = f;
+    }
 
     if (self->use_mpp_pts) {
       if (!GST_CLOCK_TIME_IS_VALID (pts)) {
@@ -627,28 +640,50 @@ gst_mpp_dec_get_frame (GstVideoDecoder * decoder, GstClockTime pts)
 
     if (GST_CLOCK_TIME_IS_VALID (f->pts)) {
       /* Prefer frame with close PTS */
-      if (abs ((gint) (f->pts - pts)) < 3 * GST_MSECOND) {
+      if (ABS (GST_CLOCK_DIFF (f->pts, pts)) < 5 * GST_MSECOND) {
         frame = f;
 
         GST_DEBUG_OBJECT (self, "using matched frame (#%d)",
             frame->system_frame_number);
+
+        /* Discard out-dated frames for some broken videos */
+        for (l = frames; l != NULL; l = l->next) {
+          GstVideoCodecFrame *f = l->data;
+
+          if (GST_CLOCK_TIME_IS_VALID (f->pts) && f->pts < frame->pts) {
+            GST_WARNING_OBJECT (self, "discarding out-dated frame (#%d)",
+                f->system_frame_number);
+
+            gst_video_codec_frame_ref (f);
+            gst_video_decoder_release_frame (decoder, f);
+          }
+        }
+
         goto out;
       }
 
       /* Filter out future frames */
       if (GST_CLOCK_TIME_IS_VALID (pts) && f->pts > pts)
         continue;
-    } else if (self->interlace_mode == GST_VIDEO_INTERLACE_MODE_MIXED) {
-      /* Consider frames with invalid PTS are decode-only when deinterlaced */
+    } else {
+      /* Prefer frame with invalid PTS */
+      if (!GST_CLOCK_TIME_IS_VALID (pts)) {
+        frame = f;
+        break;
+      }
 
-      /* Delay discarding frames for some broken videos */
-      if (i >= 16) {
-        GST_WARNING_OBJECT (self, "discarding decode-only frame (#%d)",
-            f->system_frame_number);
+      if (self->interlace_mode == GST_VIDEO_INTERLACE_MODE_MIXED) {
+        /* Consider frames with invalid PTS are decode-only when deinterlaced */
 
-        gst_video_codec_frame_ref (f);
-        gst_video_decoder_release_frame (decoder, f);
-        continue;
+        /* Delay discarding frames for some broken videos */
+        if (i >= 16) {
+          GST_WARNING_OBJECT (self, "discarding decode-only frame (#%d)",
+              f->system_frame_number);
+
+          gst_video_codec_frame_ref (f);
+          gst_video_decoder_release_frame (decoder, f);
+          continue;
+        }
       }
     }
 
@@ -860,39 +895,24 @@ gst_mpp_dec_loop (GstVideoDecoder * decoder)
     goto info_change;
   }
 
+  frame = gst_mpp_dec_get_frame (decoder, mpp_frame_get_pts (mframe));
+  if (!frame)
+    goto no_frame;
+
+  if (self->flushing && !self->draining)
+    goto drop;
+
+  if (!mpp_frame_get_buffer (mframe))
+    goto error;
+
+  if (mpp_frame_get_discard (mframe) || mpp_frame_get_errinfo (mframe))
+    goto error;
+
   if (!self->convert && gst_mpp_info_changed (&self->info, mframe)) {
     self->task_ret = gst_mpp_dec_apply_info_change (decoder, mframe);
     if (self->task_ret != GST_FLOW_OK)
       goto info_change;
   }
-
-  if (!mpp_frame_get_buffer (mframe))
-    goto out;
-
-  mode = mpp_frame_get_mode (mframe);
-#ifdef MPP_FRAME_FLAG_IEP_DEI_MASK
-  /* IEP deinterlaced */
-  if (mode & MPP_FRAME_FLAG_IEP_DEI_MASK) {
-#ifdef MPP_FRAME_FLAG_IEP_DEI_I4O2
-    if (mode & MPP_FRAME_FLAG_IEP_DEI_I4O2) {
-      /* 1 input frame generates 2 deinterlaced MPP frames */
-      static int mpp_i4o2_frames = 0;
-      if (mpp_i4o2_frames++ % 2) {
-        GST_DEBUG_OBJECT (self, "ignore extra MPP frame");
-        goto out;
-      }
-    }
-#endif
-    mode = MPP_FRAME_FLAG_DEINTERLACED;
-  }
-#endif
-
-  frame = gst_mpp_dec_get_frame (decoder, mpp_frame_get_pts (mframe));
-  if (!frame)
-    goto no_frame;
-
-  if (mpp_frame_get_discard (mframe) || mpp_frame_get_errinfo (mframe))
-    goto error;
 
   buffer = gst_mpp_dec_get_gst_buffer (decoder, mframe);
   if (!buffer)
@@ -900,15 +920,19 @@ gst_mpp_dec_loop (GstVideoDecoder * decoder)
 
   gst_buffer_resize (buffer, 0, GST_VIDEO_INFO_SIZE (&self->info));
 
+  mode = mpp_frame_get_mode (mframe);
+#ifdef MPP_FRAME_FLAG_IEP_DEI_MASK
+  /* IEP deinterlaced */
+  if (mode & MPP_FRAME_FLAG_IEP_DEI_MASK)
+    mode = MPP_FRAME_FLAG_DEINTERLACED;
+#endif
+
   gst_mpp_dec_update_interlace_mode (decoder, buffer, mode);
 
   /* HACK: Mark lockable to avoid copying in make_writable() while shared */
   GST_MINI_OBJECT_FLAG_SET (buffer, GST_MINI_OBJECT_FLAG_LOCKABLE);
 
   frame->output_buffer = buffer;
-
-  if (self->flushing && !self->draining)
-    goto drop;
 
   GST_DEBUG_OBJECT (self, "finish frame ts=%" GST_TIME_FORMAT,
       GST_TIME_ARGS (frame->pts));
